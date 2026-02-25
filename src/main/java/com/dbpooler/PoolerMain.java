@@ -17,7 +17,7 @@ import java.nio.channels.SocketChannel;
  */
 public final class PoolerMain {
 
-    private static final int DEFAULT_PORT = 5432;
+    private static final int DEFAULT_PORT = 3307;
     private static final int BUFFER_POOL_SIZE = 16384;
     private static final int BUFFER_CAPACITY = 8192;
 
