@@ -1,6 +1,7 @@
 package com.dbpooler.event;
 
 import com.dbpooler.buffer.DirectBufferPool;
+import com.dbpooler.routing.QueryRouter;
 
 import java.io.IOException;
 import java.nio.channels.SocketChannel;
@@ -16,13 +17,15 @@ public final class EventLoopGroup {
     private final Thread[] threads;
     private final AtomicInteger nextIndex;
 
-    public EventLoopGroup(final int threadCount, final DirectBufferPool bufferPool) throws IOException {
+    public EventLoopGroup(final int threadCount,
+                          final DirectBufferPool bufferPool,
+                          final QueryRouter router) throws IOException {
         this.loops = new EventLoop[threadCount];
         this.threads = new Thread[threadCount];
         this.nextIndex = new AtomicInteger(0);
 
         for (int i = 0; i < threadCount; i++) {
-            loops[i] = new EventLoop(bufferPool);
+            loops[i] = new EventLoop(bufferPool, router);
             threads[i] = new Thread(loops[i], "worker-" + i);
             threads[i].setDaemon(true);
         }

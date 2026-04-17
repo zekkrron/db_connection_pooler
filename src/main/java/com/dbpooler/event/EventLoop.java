@@ -1,6 +1,9 @@
 package com.dbpooler.event;
 
 import com.dbpooler.buffer.DirectBufferPool;
+import com.dbpooler.pool.DatabaseConnection;
+import com.dbpooler.protocol.QueryType;
+import com.dbpooler.routing.QueryRouter;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -14,19 +17,29 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * A single Worker Thread running an infinite NIO Selector loop.
- * Handles readable events on client connections assigned to it.
+ *
+ * Full data flow per readable event:
+ * 1. Read client SQL payload into a pre-allocated direct buffer
+ * 2. Parse the query type via the QueryRouter's ProtocolParser
+ * 3. Acquire a backend DatabaseConnection from the correct pool (master/replica)
+ * 4. Forward the payload to the database
+ * 5. Read the database response
+ * 6. Write the response back to the client
+ *
  * Zero-allocation in the hot path — ByteBuffers come from a pre-allocated pool.
  */
 public final class EventLoop implements Runnable {
 
     private final Selector selector;
     private final DirectBufferPool bufferPool;
+    private final QueryRouter router;
     private final Queue<SocketChannel> pendingRegistrations;
     private volatile boolean running;
 
-    public EventLoop(final DirectBufferPool bufferPool) throws IOException {
+    public EventLoop(final DirectBufferPool bufferPool, final QueryRouter router) throws IOException {
         this.selector = Selector.open();
         this.bufferPool = bufferPool;
+        this.router = router;
         this.pendingRegistrations = new ConcurrentLinkedQueue<>();
         this.running = true;
     }
@@ -85,32 +98,92 @@ public final class EventLoop implements Runnable {
         }
     }
 
+    /**
+     * Full request lifecycle:
+     * Client bytes -> parse query type -> route to pool -> forward to DB -> read response -> reply to client.
+     */
     private void handleRead(final SelectionKey key) {
-        final SocketChannel channel = (SocketChannel) key.channel();
-        final ByteBuffer buf = bufferPool.acquire();
+        final SocketChannel clientChannel = (SocketChannel) key.channel();
+        final ByteBuffer requestBuf = bufferPool.acquire();
 
-        if (buf == null) {
+        if (requestBuf == null) {
             System.err.println("[EventLoop] Buffer pool exhausted, dropping read");
             return;
         }
 
+        DatabaseConnection dbConn = null;
+        QueryType queryType = QueryType.UNKNOWN;
+        ByteBuffer responseBuf = null;
+
         try {
-            final int bytesRead = channel.read(buf);
+            // --- 1. Read client payload ---
+            final int bytesRead = clientChannel.read(requestBuf);
 
             if (bytesRead == -1) {
-                // Client disconnected
                 key.cancel();
-                closeQuietly(channel);
-            } else if (bytesRead > 0) {
-                buf.flip();
-                // Phase 1: just consume the bytes to prove the loop works.
-                // Phase 2+ will hand this buffer to the ProtocolParser.
+                closeQuietly(clientChannel);
+                return;
             }
+
+            if (bytesRead == 0) {
+                return;
+            }
+
+            requestBuf.flip();
+
+            // --- 2. Parse query type and route to the correct pool ---
+            queryType = router.parseType(requestBuf);
+            dbConn = router.acquireFor(queryType);
+
+            if (dbConn == null) {
+                System.err.println("[EventLoop] No available connection for " + queryType + ", dropping request");
+                return;
+            }
+
+            // --- 3. Forward client payload to the database ---
+            while (requestBuf.hasRemaining()) {
+                dbConn.write(requestBuf);
+            }
+
+            // --- 4. Read database response ---
+            responseBuf = bufferPool.acquire();
+            if (responseBuf == null) {
+                System.err.println("[EventLoop] Buffer pool exhausted for response, dropping");
+                return;
+            }
+
+            final int dbBytes = dbConn.read(responseBuf);
+
+            if (dbBytes > 0) {
+                responseBuf.flip();
+
+                // --- 5. Write response back to client ---
+                while (responseBuf.hasRemaining()) {
+                    clientChannel.write(responseBuf);
+                }
+            } else if (dbBytes == -1) {
+                // Database closed the connection — mark stale so janitor replaces it
+                dbConn.markStale();
+                dbConn = null;
+                key.cancel();
+                closeQuietly(clientChannel);
+            }
+
         } catch (final IOException e) {
             key.cancel();
-            closeQuietly(channel);
+            closeQuietly(clientChannel);
+            if (dbConn != null) {
+                dbConn.markStale();
+                dbConn = null;
+            }
         } finally {
-            bufferPool.release(buf);
+            bufferPool.release(requestBuf);
+            if (responseBuf != null) {
+                bufferPool.release(responseBuf);
+            }
+            if (dbConn != null) {
+                router.releaseFor(dbConn, queryType);
+            }
         }
     }
 

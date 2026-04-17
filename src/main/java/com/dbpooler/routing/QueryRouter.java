@@ -47,11 +47,36 @@ public final class QueryRouter {
     }
 
     /**
-     * Release a connection back to whichever pool it belongs to.
-     * For now, the caller must know which pool — in a future iteration
-     * we can tag connections with their origin pool.
+     * Determine the query type from the raw byte payload without acquiring a connection.
+     * Used by the EventLoop to separate parsing from acquisition.
+     *
+     * @param buf the client's raw SQL payload (flipped, ready for reading)
+     * @return the classified QueryType
      */
-    public void release(final DatabaseConnection connection, final QueryType type) {
+    public QueryType parseType(final ByteBuffer buf) {
+        return parser.parse(buf);
+    }
+
+    /**
+     * Acquire a connection from the pool matching the given query type.
+     *
+     * @param type the query classification
+     * @return a DatabaseConnection in BUSY state, or null if pool is exhausted
+     */
+    public DatabaseConnection acquireFor(final QueryType type) {
+        return switch (type) {
+            case READ -> replicaPool.acquire();
+            case WRITE, UNKNOWN -> masterPool.acquire();
+        };
+    }
+
+    /**
+     * Release a connection back to whichever pool matches the query type.
+     *
+     * @param connection the connection to release
+     * @param type       the query type that determined the pool
+     */
+    public void releaseFor(final DatabaseConnection connection, final QueryType type) {
         switch (type) {
             case READ -> replicaPool.release(connection);
             case WRITE, UNKNOWN -> masterPool.release(connection);

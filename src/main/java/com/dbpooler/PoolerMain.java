@@ -73,7 +73,7 @@ public final class PoolerMain {
         replicaJanitorThread.start();
 
         // --- Worker threads ---
-        final EventLoopGroup group = new EventLoopGroup(workerCount, bufferPool);
+        final EventLoopGroup group = new EventLoopGroup(workerCount, bufferPool, router);
         group.start();
 
         // --- Accept loop ---

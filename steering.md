@@ -48,7 +48,28 @@ Database connection wrappers must maintain a strict, atomic state machine: `IDLE
 
 ---
 
-## 5. Testing & Benchmarking Strategy (NOTE: For execution after Phase 5)
+## 5. Design Discussion: Shared vs. Thread-Local Buffer Pools (TODO)
+
+**Current State:** All Worker Threads pull from a single shared `DirectBufferPool`. It is lock-free (CAS-based) and fast, but threads still compete for buffer slots at the hardware level — every `getAndSet` / `compareAndSet` on the shared `AtomicReferenceArray` causes cache line traffic between cores.
+
+**The Thread-Local Optimization:** In hyper-optimized systems like Netty (which powers Cassandra, Elasticsearch, and most high-throughput Java infrastructure), each Worker Thread owns a private buffer pool. If Thread 1 only ever touches Buffer Pool 1, there is literally zero cross-core contention — no CAS, no cache bouncing, no false sharing. The buffer acquire/release becomes a plain array index read/write on a single core.
+
+**How it would work in our codebase:**
+- Instead of passing a shared `DirectBufferPool` into `EventLoopGroup`, each `EventLoop` would own its own `DirectBufferPool` (or a simpler non-atomic array, since no other thread touches it).
+- The `EventLoop` constructor would allocate its private pool: `new DirectBufferPool(perThreadPoolSize, bufferCapacity)`.
+- Since each event loop is pinned to one thread, no synchronization is needed at all — acquire/release becomes a plain array scan with no atomics.
+- Total memory stays the same (just partitioned), but throughput under contention improves because cores never invalidate each other's cache lines for buffer operations.
+
+**Trade-offs to discuss:**
+- Simpler per-thread code (no CAS needed) vs. slightly uneven memory utilization if some threads are busier than others.
+- A shared pool can absorb burst traffic on any thread; per-thread pools can starve if one thread gets a spike. Netty solves this with a fallback to a shared "arena" when the thread-local pool is exhausted.
+- Implementation complexity is low — the main change is in `EventLoopGroup` and `EventLoop` construction.
+
+**Decision:** To be discussed. May or may not implement, but understanding this trade-off is important for interviews and for knowing where the next level of optimization lives.
+
+---
+
+## 6. Testing & Benchmarking Strategy (NOTE: For execution after Phase 5)
 
 The system must be proven under enterprise-level load. The testing architecture is as follows:
 
